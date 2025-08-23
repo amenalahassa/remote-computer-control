@@ -5,7 +5,9 @@ Handles AI task interpretation and execution
 
 import logging
 import asyncio
+import os
 from typing import Optional, Dict, Any
+from dotenv import load_dotenv
 
 logger = logging.getLogger(__name__)
 
@@ -13,32 +15,49 @@ class InterpreterBridge:
     """Bridge between Discord bot and Open Interpreter"""
     
     def __init__(self):
+        load_dotenv()
         self.interpreter = None
         self.initialize_interpreter()
         
     def initialize_interpreter(self):
-        """Initialize Open Interpreter with safe settings"""
+        """Initialize Open Interpreter with LM Studio settings"""
         try:
-            import interpreter
+            from interpreter import interpreter
+            
+            # Configure for LM Studio
+            llm_provider = os.getenv('LLM_PROVIDER', 'lmstudio')
+            llm_model = os.getenv('LLM_MODEL', 'google/gemma-3n-e4b')
+            lm_studio_url = os.getenv('LM_STUDIO_BASE_URL', 'http://localhost:1234/v1')
+            
+            # Set up interpreter for local LLM
+            interpreter.llm.model = f"{llm_provider}/{llm_model}"
+            interpreter.llm.api_base = lm_studio_url
+            interpreter.llm.api_key = "not-needed"  # LM Studio doesn't need API key
+            
+            # Configure interpreter settings
+            interpreter.auto_run = True  # Auto-run commands for automation
+            interpreter.verbose = True  # Show what's happening
+            interpreter.safe_mode = 'off'  # Trust local execution
+            interpreter.offline = True  # Use local models
+            
             self.interpreter = interpreter
             
-            # Configure interpreter for safe local execution
-            self.interpreter.auto_run = False  # Require confirmation
-            self.interpreter.safe_mode = 'ask'  # Ask before running code
-            self.interpreter.offline = True  # Use local models if available
+            logger.info(f"Open Interpreter initialized with {llm_provider} using model {llm_model}")
+            logger.info(f"LM Studio URL: {lm_studio_url}")
             
-            logger.info("Open Interpreter initialized successfully")
         except ImportError:
             logger.error("Open Interpreter not installed. Please install with: pip install open-interpreter")
             self.interpreter = None
+        except Exception as e:
+            logger.error(f"Failed to initialize interpreter: {e}")
+            self.interpreter = None
     
-    async def process_message(self, message: str, user_id: str) -> Dict[str, Any]:
+    async def process_message(self, message: str) -> Dict[str, Any]:
         """
         Process a message through the interpreter
         
         Args:
             message: The user's message/command
-            user_id: Discord user ID for logging
             
         Returns:
             Dictionary with execution results
@@ -46,12 +65,12 @@ class InterpreterBridge:
         if not self.interpreter:
             return {
                 'success': False,
-                'error': 'Interpreter not initialized',
+                'error': 'Interpreter not initialized. Check LM Studio is running.',
                 'output': None
             }
         
         try:
-            logger.info(f"Processing message from user {user_id}: {message}")
+            logger.info(f"Processing message: {message}")
             
             # Run interpreter in a thread to avoid blocking
             loop = asyncio.get_event_loop()
@@ -78,7 +97,7 @@ class InterpreterBridge:
     def _execute_interpreter(self, message: str) -> str:
         """Execute interpreter synchronously (called in thread)"""
         try:
-            # Run the interpreter with the message
+            # Send message to interpreter
             response = self.interpreter.chat(message)
             
             # Format the response
@@ -88,102 +107,20 @@ class InterpreterBridge:
             else:
                 output = str(response)
                 
+            logger.info(f"Interpreter response: {output[:200]}...")  # Log first 200 chars
             return output
             
         except Exception as e:
             logger.error(f"Interpreter execution error: {e}")
             raise
     
-    async def execute_task(self, task_type: str, params: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Execute a specific task type
-        
-        Args:
-            task_type: Type of task (screenshot, open_app, etc.)
-            params: Parameters for the task
-            
-        Returns:
-            Execution results
-        """
-        task_handlers = {
-            'screenshot': self._take_screenshot,
-            'open_app': self._open_application,
-            'create_file': self._create_file,
-            'system_info': self._get_system_info
-        }
-        
-        handler = task_handlers.get(task_type)
-        if not handler:
-            return {
-                'success': False,
-                'error': f'Unknown task type: {task_type}',
-                'output': None
-            }
-        
+    def reset_conversation(self):
+        """Reset the interpreter conversation"""
         try:
-            result = await handler(params)
-            return {
-                'success': True,
-                'output': result,
-                'error': None
-            }
+            if self.interpreter:
+                self.interpreter.messages = []
+                logger.info("Interpreter conversation reset")
+                return True
         except Exception as e:
-            logger.error(f"Task execution error: {e}")
-            return {
-                'success': False,
-                'error': str(e),
-                'output': None
-            }
-    
-    async def _take_screenshot(self, params: Dict[str, Any]) -> str:
-        """Take a screenshot of the desktop"""
-        import pyautogui
-        from datetime import datetime
-        
-        filename = params.get('filename', f'screenshot_{datetime.now().strftime("%Y%m%d_%H%M%S")}.png')
-        screenshot = pyautogui.screenshot()
-        filepath = f'src/logs/{filename}'
-        screenshot.save(filepath)
-        
-        return f"Screenshot saved to {filepath}"
-    
-    async def _open_application(self, params: Dict[str, Any]) -> str:
-        """Open an application"""
-        import subprocess
-        import platform
-        
-        app_name = params.get('app_name', '')
-        
-        if platform.system() == 'Windows':
-            subprocess.Popen(['start', app_name], shell=True)
-        elif platform.system() == 'Darwin':  # macOS
-            subprocess.Popen(['open', '-a', app_name])
-        else:  # Linux
-            subprocess.Popen([app_name])
-        
-        return f"Opened application: {app_name}"
-    
-    async def _create_file(self, params: Dict[str, Any]) -> str:
-        """Create a file with content"""
-        filename = params.get('filename', 'untitled.txt')
-        content = params.get('content', '')
-        
-        with open(filename, 'w') as f:
-            f.write(content)
-        
-        return f"Created file: {filename}"
-    
-    async def _get_system_info(self, params: Dict[str, Any]) -> str:
-        """Get system information"""
-        import psutil
-        import platform
-        
-        info = {
-            'platform': platform.system(),
-            'processor': platform.processor(),
-            'cpu_count': psutil.cpu_count(),
-            'memory': f"{psutil.virtual_memory().percent}% used",
-            'disk': f"{psutil.disk_usage('/').percent}% used"
-        }
-        
-        return str(info)
+            logger.error(f"Failed to reset conversation: {e}")
+            return False
