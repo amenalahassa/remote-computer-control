@@ -1,22 +1,28 @@
 """
 Bridge module to connect Discord messages with Open Interpreter
-Handles AI task interpretation and execution
+Handles AI task interpretation and execution with streaming support
 """
 
 import logging
 import asyncio
 import os
-from typing import Optional, Dict, Any
+import threading
+from typing import Optional, Dict, Any, AsyncGenerator
 from dotenv import load_dotenv
+from queue import Queue
+import time
 
 logger = logging.getLogger(__name__)
 
 class InterpreterBridge:
-    """Bridge between Discord bot and Open Interpreter"""
+    """Bridge between Discord bot and Open Interpreter with streaming support"""
     
     def __init__(self):
         load_dotenv()
         self.interpreter = None
+        self.current_task = None
+        self.cancel_flag = threading.Event()
+        self.output_queue = Queue()
         self.initialize_interpreter()
         
     def initialize_interpreter(self):
@@ -39,14 +45,25 @@ class InterpreterBridge:
             interpreter.verbose = True  # Show what's happening
             interpreter.safe_mode = 'off'  # Trust local execution
             interpreter.offline = True  # Use local models
-
-            interpreter.llm.context_window = int(os.getenv('LLM_CONTEXT_WINDOW', 5))
-            interpreter.llm.max_tokens = int(os.getenv('LLM_MAX_TOKENS', 1000))
+            
+            # Set context window and max tokens from env
+            interpreter.llm.context_window = int(os.getenv('LLM_CONTEXT_WINDOW', 8192))
+            interpreter.llm.max_tokens = int(os.getenv('LLM_MAX_TOKENS', 2000))
+            
+            # Set output directory
+            output_dir = os.path.abspath("src/output")
+            os.makedirs(output_dir, exist_ok=True)
+            interpreter.system_message += f"""When saving files, use the output directory: {output_dir}
+            You can read and write files from/to this directory.
+            Current working directory: {os.getcwd()}
+            """
             
             self.interpreter = interpreter
+            self.output_dir = output_dir
             
             logger.info(f"Open Interpreter initialized with {llm_provider} using model {llm_model}")
             logger.info(f"LM Studio URL: {lm_studio_url}")
+            logger.info(f"Output directory: {output_dir}")
             
         except ImportError:
             logger.error("Open Interpreter not installed. Please install with: pip install open-interpreter")
@@ -55,67 +72,211 @@ class InterpreterBridge:
             logger.error(f"Failed to initialize interpreter: {e}")
             self.interpreter = None
     
-    async def process_message(self, message: str) -> Dict[str, Any]:
+    def load_context(self, messages: list):
+        """Load conversation context into interpreter"""
+        if self.interpreter and messages:
+            try:
+                # Set the conversation history
+                self.interpreter.messages = messages
+                logger.info(f"Loaded {len(messages)} messages into context")
+            except Exception as e:
+                logger.error(f"Failed to load context: {e}")
+    
+    async def process_message_stream(self, message: str) -> AsyncGenerator[Dict[str, Any], None]:
         """
-        Process a message through the interpreter
+        Process a message through the interpreter with streaming output
         
-        Args:
-            message: The user's message/command
-            
-        Returns:
-            Dictionary with execution results
+        Yields dictionaries with:
+        - type: 'message', 'code', 'console', 'confirmation', 'error'
+        - content: The actual content
+        - metadata: Additional information
         """
         if not self.interpreter:
-            return {
-                'success': False,
-                'error': 'Interpreter not initialized. Check LM Studio is running.',
-                'output': None
+            yield {
+                'type': 'error',
+                'content': 'Interpreter not initialized. Check LM Studio is running.',
+                'metadata': {}
             }
+            return
         
         try:
-            logger.info(f"Processing message: {message}")
+            logger.info(f"Processing message with streaming: {message[:100]}...")
             
-            # Run interpreter in a thread to avoid blocking
-            loop = asyncio.get_event_loop()
-            result = await loop.run_in_executor(
-                None,
-                self._execute_interpreter,
-                message
+            # Clear cancel flag and queue
+            self.cancel_flag.clear()
+            while not self.output_queue.empty():
+                self.output_queue.get()
+            
+            # Start interpreter in a thread
+            thread = threading.Thread(
+                target=self._run_interpreter_stream,
+                args=(message,)
             )
+            thread.start()
             
-            return {
-                'success': True,
-                'output': result,
-                'error': None
-            }
+            # Stream output from queue
+            last_yield_time = time.time()
+            accumulated_content = []
+            current_type = None
+            
+            while thread.is_alive() or not self.output_queue.empty():
+                try:
+                    if not self.output_queue.empty():
+                        chunk = self.output_queue.get(timeout=0.1)
+                        
+                        # Check for cancellation
+                        if chunk.get('type') == 'cancelled':
+                            yield chunk
+                            break
+                        
+                        # Accumulate similar types for batching
+                        if current_type == chunk['type'] and chunk['type'] == 'message':
+                            accumulated_content.append(chunk['content'])
+                            
+                            # Yield accumulated content periodically
+                            if time.time() - last_yield_time > 0.5:  # Every 500ms
+                                yield {
+                                    'type': current_type,
+                                    'content': ''.join(accumulated_content),
+                                    'metadata': chunk.get('metadata', {})
+                                }
+                                accumulated_content = []
+                                last_yield_time = time.time()
+                        else:
+                            # Yield any accumulated content first
+                            if accumulated_content:
+                                yield {
+                                    'type': current_type,
+                                    'content': ''.join(accumulated_content),
+                                    'metadata': {}
+                                }
+                                accumulated_content = []
+                            
+                            # Yield the new chunk
+                            yield chunk
+                            current_type = chunk['type']
+                            last_yield_time = time.time()
+                    
+                    await asyncio.sleep(0.01)  # Small delay to prevent CPU spinning
+                    
+                except:
+                    await asyncio.sleep(0.01)
+            
+            # Yield any remaining accumulated content
+            if accumulated_content:
+                yield {
+                    'type': current_type,
+                    'content': ''.join(accumulated_content),
+                    'metadata': {}
+                }
+            
+            # Ensure thread is done
+            thread.join(timeout=1.0)
             
         except Exception as e:
-            logger.error(f"Error processing message: {e}")
-            return {
-                'success': False,
-                'error': str(e),
-                'output': None
+            logger.error(f"Error in stream processing: {e}")
+            yield {
+                'type': 'error',
+                'content': str(e),
+                'metadata': {}
             }
     
-    def _execute_interpreter(self, message: str) -> str:
-        """Execute interpreter synchronously (called in thread)"""
+    def _run_interpreter_stream(self, message: str):
+        """Run interpreter and stream output (runs in thread)"""
         try:
-            # Send message to interpreter
-            response = self.interpreter.chat(message)
-            
-            # Format the response
-            if isinstance(response, list):
-                # Join multiple responses
-                output = "\n".join(str(item) for item in response)
-            else:
-                output = str(response)
+            # Custom display function to capture streaming output
+            def display_output(output):
+                if self.cancel_flag.is_set():
+                    return False  # Stop execution
                 
-            logger.info(f"Interpreter response: {output[:200]}...")  # Log first 200 chars
-            return output
+                # Parse output type
+                if isinstance(output, dict):
+                    output_type = output.get('type', 'message')
+                    content = output.get('content', '')
+                    
+                    if output_type == 'code':
+                        self.output_queue.put({
+                            'type': 'code',
+                            'content': content,
+                            'metadata': {'language': output.get('language', 'python')}
+                        })
+                    elif output_type == 'console':
+                        self.output_queue.put({
+                            'type': 'console',
+                            'content': content,
+                            'metadata': {}
+                        })
+                    elif output_type == 'confirmation':
+                        # Auto-confirm for now
+                        self.output_queue.put({
+                            'type': 'confirmation',
+                            'content': content,
+                            'metadata': {'auto_confirmed': True}
+                        })
+                        return True  # Confirm execution
+                    else:
+                        self.output_queue.put({
+                            'type': 'message',
+                            'content': str(content),
+                            'metadata': {}
+                        })
+                else:
+                    # Plain text output
+                    self.output_queue.put({
+                        'type': 'message',
+                        'content': str(output),
+                        'metadata': {}
+                    })
+                
+                return not self.cancel_flag.is_set()
             
+            # Set custom display
+            original_display = getattr(self.interpreter, 'display', None)
+            self.interpreter.display = display_output
+            
+            # Run interpreter
+            for chunk in self.interpreter.chat(message, display=True, stream=True):
+                if self.cancel_flag.is_set():
+                    self.output_queue.put({
+                        'type': 'cancelled',
+                        'content': 'Task cancelled by user',
+                        'metadata': {}
+                    })
+                    break
+                
+                # Process streaming chunk
+                if chunk:
+                    if isinstance(chunk, dict):
+                        if 'content' in chunk:
+                            self.output_queue.put({
+                                'type': chunk.get('type', 'message'),
+                                'content': chunk['content'],
+                                'metadata': chunk.get('metadata', {})
+                            })
+                    else:
+                        self.output_queue.put({
+                            'type': 'message',
+                            'content': str(chunk),
+                            'metadata': {}
+                        })
+            
+            # Restore original display
+            if original_display:
+                self.interpreter.display = original_display
+                
         except Exception as e:
             logger.error(f"Interpreter execution error: {e}")
-            raise
+            self.output_queue.put({
+                'type': 'error',
+                'content': str(e),
+                'metadata': {}
+            })
+    
+    def cancel_current_task(self):
+        """Cancel the currently running task"""
+        self.cancel_flag.set()
+        logger.info("Cancellation requested")
+        return True
     
     def reset_conversation(self):
         """Reset the interpreter conversation"""
@@ -127,3 +288,7 @@ class InterpreterBridge:
         except Exception as e:
             logger.error(f"Failed to reset conversation: {e}")
             return False
+    
+    def get_output_directory(self) -> str:
+        """Get the output directory path"""
+        return self.output_dir

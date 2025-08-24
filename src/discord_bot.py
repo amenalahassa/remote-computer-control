@@ -1,14 +1,17 @@
 """
 Discord bot module for the Local AI Productivity Assistant
-Handles Discord integration and message processing
+Handles Discord integration with slash commands and streaming
 """
 
 import discord
 from discord.ext import commands
+from discord import app_commands
 import os
 import logging
 import asyncio
 from interpreter_bridge import InterpreterBridge
+from database import ChatDatabase
+from typing import Optional
 
 # Configure logging
 os.makedirs('src/logs', exist_ok=True)
@@ -23,7 +26,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 class ProductivityBot(commands.Bot):
-    """Discord bot for local productivity assistance"""
+    """Discord bot for local productivity assistance with slash commands"""
     
     def __init__(self):
         intents = discord.Intents.default()
@@ -32,12 +35,37 @@ class ProductivityBot(commands.Bot):
         
         super().__init__(command_prefix='!', intents=intents)
         self.interpreter_bridge = InterpreterBridge()
+        self.db = ChatDatabase()
+        self.active_messages = {}  # Track active streaming messages
         
+        # Load conversation history on startup
+        self._load_history()
+    
+    def _load_history(self):
+        """Load conversation history into interpreter"""
+        try:
+            context = self.db.get_conversation_context(limit=20)
+            if context:
+                self.interpreter_bridge.load_context(context)
+                logger.info(f"Loaded {len(context)} messages from history")
+        except Exception as e:
+            logger.error(f"Failed to load history: {e}")
+    
+    async def setup_hook(self):
+        """Setup hook for syncing slash commands"""
+        try:
+            # Sync commands globally (or to specific guild)
+            synced = await self.tree.sync()
+            logger.info(f"Synced {len(synced)} command(s)")
+        except Exception as e:
+            logger.error(f"Failed to sync commands: {e}")
+    
     async def on_ready(self):
         """Called when bot successfully connects to Discord"""
         logger.info(f'Bot connected as {self.user}')
         print(f'✅ Bot is ready! Logged in as {self.user}')
         print(f'Connected to {len(self.guilds)} server(s)')
+        print(f'Slash commands are ready! Type / to see available commands')
         
     async def on_message(self, message):
         """Process incoming messages"""
@@ -45,8 +73,14 @@ class ProductivityBot(commands.Bot):
         if message.author.bot:
             return
         
-        # Log the message
-        logger.info(f'Message from {message.author}: {message.content}')
+        # Log the message to database
+        self.db.add_message(
+            user_id=str(message.author.id),
+            username=message.author.name,
+            role='user',
+            content=message.content,
+            message_type='text'
+        )
         
         # Check if message is a command first
         ctx = await self.get_context(message)
@@ -56,106 +90,292 @@ class ProductivityBot(commands.Bot):
         
         # If not a command, process with Open Interpreter
         if message.content.strip():
-            await self.process_with_interpreter(message)
+            await self.process_with_interpreter_stream(message)
     
-    async def process_with_interpreter(self, message):
-        """Send message to Open Interpreter and return response"""
+    async def process_with_interpreter_stream(self, message):
+        """Send message to Open Interpreter with streaming response"""
         try:
-            # Show typing indicator
-            async with message.channel.typing():
-                # Process message through interpreter
-                result = await self.interpreter_bridge.process_message(message.content)
+            # Create initial message
+            response_msg = await message.reply("🤔 Processing...")
+            self.active_messages[response_msg.id] = True
+            
+            # Stream content accumulation
+            full_content = []
+            code_blocks = []
+            console_output = []
+            current_section = "message"
+            
+            # Process streaming response
+            async for chunk in self.interpreter_bridge.process_message_stream(message.content):
+                # Check if message was cancelled
+                if response_msg.id not in self.active_messages:
+                    break
                 
-                if result['success']:
-                    output = result['output']
+                chunk_type = chunk.get('type', 'message')
+                content = chunk.get('content', '')
+                
+                if chunk_type == 'cancelled':
+                    await response_msg.edit(content="❌ Task cancelled by user")
+                    break
+                elif chunk_type == 'error':
+                    await response_msg.edit(content=f"❌ Error: {content}")
+                    break
+                elif chunk_type == 'code':
+                    # Accumulate code blocks
+                    language = chunk.get('metadata', {}).get('language', 'python')
+                    code_blocks.append(f"```{language}\n{content}\n```")
+                    current_section = "code"
+                elif chunk_type == 'console':
+                    # Accumulate console output
+                    console_output.append(f"```console\n{content}\n```")
+                    current_section = "console"
+                elif chunk_type == 'confirmation':
+                    # Show confirmation message
+                    full_content.append(f"✅ Auto-confirmed: {content}")
+                else:  # message type
+                    full_content.append(content)
+                    current_section = "message"
+                
+                # Update message periodically with accumulated content
+                try:
+                    display_content = self._format_display_content(
+                        full_content, code_blocks, console_output
+                    )
                     
-                    # Split long messages
-                    if len(output) > 1900:
-                        # Send as file for very long outputs
-                        with open('src/logs/output.txt', 'w') as f:
-                            f.write(output)
-                        await message.reply(
-                            "Response was too long, sending as file:",
-                            file=discord.File('src/logs/output.txt')
-                        )
+                    # Discord message limit
+                    if len(display_content) > 1900:
+                        # Save to file and send
+                        await self._send_as_file(response_msg, display_content)
+                        break
                     else:
-                        # Send as message
-                        await message.reply(f"```\n{output}\n```")
-                else:
-                    error_msg = result['error']
-                    await message.reply(f"❌ Error: {error_msg}")
-                    
+                        await response_msg.edit(content=display_content)
+                except discord.errors.HTTPException:
+                    # Rate limited, wait a bit
+                    await asyncio.sleep(1)
+            
+            # Final update
+            final_content = self._format_display_content(
+                full_content, code_blocks, console_output
+            )
+            
+            # Save assistant response to database
+            self.db.add_message(
+                user_id='bot',
+                username=self.user.name,
+                role='assistant',
+                content=final_content,
+                message_type='mixed'
+            )
+            
+            # Clean up active message
+            if response_msg.id in self.active_messages:
+                del self.active_messages[response_msg.id]
+                
         except Exception as e:
             logger.error(f"Error processing message: {e}")
             await message.reply(f"❌ An error occurred: {str(e)}")
+    
+    def _format_display_content(self, messages, code_blocks, console_output):
+        """Format content for Discord display"""
+        parts = []
+        
+        if messages:
+            parts.append('\n'.join(messages))
+        
+        if code_blocks:
+            parts.append('\n**Code:**\n' + '\n'.join(code_blocks))
+        
+        if console_output:
+            parts.append('\n**Output:**\n' + '\n'.join(console_output))
+        
+        return '\n'.join(parts) if parts else "🤔 Processing..."
+    
+    async def _send_as_file(self, message, content):
+        """Send long content as a file"""
+        try:
+            output_path = os.path.join(self.interpreter_bridge.get_output_directory(), 'response.md')
+            with open(output_path, 'w', encoding='utf-8') as f:
+                f.write(content)
+            
+            await message.edit(
+                content="Response was too long, sending as file:",
+                attachments=[discord.File(output_path, filename='response.md')]
+            )
+        except Exception as e:
+            logger.error(f"Failed to send as file: {e}")
+
+# Create bot instance
+bot = ProductivityBot()
+
+# Slash Commands
+@bot.tree.command(name="ask", description="Ask the AI assistant anything")
+@app_commands.describe(prompt="Your question or task for the AI")
+async def ask(interaction: discord.Interaction, prompt: str):
+    """Slash command to ask the AI"""
+    await interaction.response.defer()
+    
+    # Log to database
+    bot.db.add_message(
+        user_id=str(interaction.user.id),
+        username=interaction.user.name,
+        role='user',
+        content=prompt,
+        message_type='text'
+    )
+    
+    # Process with streaming
+    full_response = []
+    
+    try:
+        async for chunk in bot.interpreter_bridge.process_message_stream(prompt):
+            if chunk.get('type') == 'error':
+                await interaction.followup.send(f"❌ Error: {chunk.get('content')}")
+                return
+            elif chunk.get('type') == 'cancelled':
+                await interaction.followup.send("❌ Task cancelled")
+                return
+            else:
+                full_response.append(chunk.get('content', ''))
+        
+        response_text = ''.join(full_response)
+        
+        # Save to database
+        bot.db.add_message(
+            user_id='bot',
+            username=bot.user.name,
+            role='assistant',
+            content=response_text,
+            message_type='text'
+        )
+        
+        # Send response
+        if len(response_text) > 1900:
+            # Send as file
+            output_path = os.path.join(bot.interpreter_bridge.get_output_directory(), 'response.txt')
+            with open(output_path, 'w', encoding='utf-8') as f:
+                f.write(response_text)
+            await interaction.followup.send(
+                "Response was too long, sending as file:",
+                file=discord.File(output_path)
+            )
+        else:
+            await interaction.followup.send(f"```\n{response_text}\n```")
+            
+    except Exception as e:
+        logger.error(f"Error in ask command: {e}")
+        await interaction.followup.send(f"❌ Error: {str(e)}")
+
+@bot.tree.command(name="cancel", description="Cancel the current AI task")
+async def cancel(interaction: discord.Interaction):
+    """Cancel the currently running task"""
+    if bot.interpreter_bridge.cancel_current_task():
+        await interaction.response.send_message("🛑 Cancelling current task...")
+        
+        # Cancel any active streaming messages
+        for msg_id in list(bot.active_messages.keys()):
+            del bot.active_messages[msg_id]
+    else:
+        await interaction.response.send_message("ℹ️ No active task to cancel")
+
+@bot.tree.command(name="status", description="Check the assistant status")
+async def status(interaction: discord.Interaction):
+    """Check bot and interpreter status"""
+    interpreter_status = "✅ Connected" if bot.interpreter_bridge.interpreter else "❌ Not connected"
+    
+    embed = discord.Embed(
+        title="Assistant Status",
+        color=discord.Color.green() if bot.interpreter_bridge.interpreter else discord.Color.red()
+    )
+    embed.add_field(name="Bot", value="✅ Online", inline=True)
+    embed.add_field(name="Open Interpreter", value=interpreter_status, inline=True)
+    embed.add_field(name="LLM Provider", value=os.getenv('LLM_PROVIDER', 'lmstudio'), inline=True)
+    embed.add_field(name="Model", value=os.getenv('LLM_MODEL', 'Not set'), inline=False)
+    embed.add_field(name="Output Directory", value=bot.interpreter_bridge.get_output_directory(), inline=False)
+    
+    # Add history stats
+    recent_messages = bot.db.get_recent_messages(limit=100)
+    embed.add_field(name="Chat History", value=f"{len(recent_messages)} messages", inline=True)
+    
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="reset", description="Reset the conversation context")
+async def reset(interaction: discord.Interaction):
+    """Reset conversation context"""
+    if bot.interpreter_bridge.reset_conversation():
+        await interaction.response.send_message("🔄 Conversation context reset successfully!")
+    else:
+        await interaction.response.send_message("❌ Failed to reset conversation")
+
+@bot.tree.command(name="history", description="Export chat history")
+async def history(interaction: discord.Interaction):
+    """Export chat history to file"""
+    await interaction.response.defer()
+    
+    try:
+        export_path = bot.db.export_history()
+        if export_path and os.path.exists(export_path):
+            await interaction.followup.send(
+                "📜 Chat history exported:",
+                file=discord.File(export_path, filename="chat_history.json")
+            )
+        else:
+            await interaction.followup.send("❌ Failed to export history")
+    except Exception as e:
+        logger.error(f"Error exporting history: {e}")
+        await interaction.followup.send(f"❌ Error: {str(e)}")
+
+@bot.tree.command(name="help_ai", description="Show help for using the AI assistant")
+async def help_ai(interaction: discord.Interaction):
+    """Show help message"""
+    help_text = """
+**Local AI Productivity Assistant - Help**
+
+**Slash Commands (works great on mobile!):**
+• `/ask [prompt]` - Ask the AI anything
+• `/cancel` - Cancel current task
+• `/status` - Check bot and interpreter status
+• `/reset` - Reset conversation context
+• `/history` - Export chat history
+• `/help_ai` - Show this help
+
+**Natural Language (just type!):**
+• "Take a screenshot"
+• "Create a file called test.txt"
+• "Show system information"
+• "What files are in the output directory?"
+
+**Features:**
+• 🔄 Streaming responses - see output as it's generated
+• 💾 Persistent chat history across sessions
+• 📁 Output directory for all generated files
+• ❌ Cancel long-running tasks with `/cancel`
+
+**Output Directory:** All files are saved to `src/output/`
+    """
+    
+    embed = discord.Embed(
+        title="AI Assistant Help",
+        description=help_text,
+        color=discord.Color.blue()
+    )
+    
+    await interaction.response.send_message(embed=embed)
+
+# Legacy commands (prefix-based)
+@bot.command(name='ping')
+async def ping(ctx):
+    """Test command to check if bot is responsive"""
+    await ctx.send('🏓 Pong! Assistant is running.')
 
 async def run_bot(token):
     """Run the Discord bot"""
-    bot = ProductivityBot()
-    
-    @bot.command(name='ping')
-    async def ping(ctx):
-        """Test command to check if bot is responsive"""
-        await ctx.send('🏓 Pong! Assistant is running.')
-    
-    @bot.command(name='status')
-    async def status(ctx):
-        """Check the status of the assistant"""
-        interpreter_status = "✅ Connected" if bot.interpreter_bridge.interpreter else "❌ Not connected"
-        
-        embed = discord.Embed(
-            title="Assistant Status",
-            color=discord.Color.green() if bot.interpreter_bridge.interpreter else discord.Color.red()
-        )
-        embed.add_field(name="Bot", value="✅ Online", inline=True)
-        embed.add_field(name="Open Interpreter", value=interpreter_status, inline=True)
-        embed.add_field(name="LLM Provider", value=os.getenv('LLM_PROVIDER', 'lmstudio'), inline=True)
-        embed.add_field(name="Model", value=os.getenv('LLM_MODEL', 'Not set'), inline=False)
-        
-        await ctx.send(embed=embed)
-    
-    @bot.command(name='reset')
-    async def reset(ctx):
-        """Reset the interpreter conversation"""
-        if bot.interpreter_bridge.reset_conversation():
-            await ctx.send("🔄 Conversation reset successfully!")
-        else:
-            await ctx.send("❌ Failed to reset conversation")
-    
-    @bot.command(name='help_ai')
-    async def help_ai(ctx):
-        """Show help for using the AI assistant"""
-        help_text = """
-**Local AI Productivity Assistant - Help**
-
-**Natural Language Commands:**
-Just type normally! The assistant understands requests like:
-• "Take a screenshot"
-• "Open notepad"
-• "Create a file called test.txt"
-• "Show system information"
-• "What files are in the current directory?"
-
-**Bot Commands:**
-• `!ping` - Check if bot is responsive
-• `!status` - Show bot and interpreter status
-• `!reset` - Reset the conversation context
-• `!help_ai` - Show this help message
-
-**Tips:**
-• Be specific in your requests
-• The assistant can execute code and system commands
-• Long responses will be sent as files
-        """
-        await ctx.send(help_text)
-    
     try:
         await bot.start(token)
     except Exception as e:
         logger.error(f'Failed to start bot: {e}')
         raise
 
-# Main entry point for running the bot
+# Main entry point
 def main():
     """Main function to run the Discord bot"""
     from dotenv import load_dotenv
