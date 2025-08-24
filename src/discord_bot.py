@@ -90,14 +90,17 @@ class ProductivityBot(commands.Bot):
         if message.content.strip():
             await self.process_with_interpreter_stream(message)
 
+
+
     async def process_message(self, response_msg, content):
         """Process message without streaming (legacy)"""
         self.active_messages[response_msg.id] = True  # Mark message as active
         try:
             # Stream content accumulation
             full_content = []
-            code_blocks = []
-            console_output = []
+            last_chuck_type = None
+            current_content = []
+            display_content = ""
 
             # Process streaming response
             async for chunk in self.interpreter_bridge.process_message_stream(content):
@@ -108,31 +111,34 @@ class ProductivityBot(commands.Bot):
                 chunk_type = chunk.get('type', 'message')
                 content = chunk.get('content', '')
 
+                if last_chuck_type is None:
+                    last_chuck_type = chunk_type
+
                 if chunk_type == 'cancelled':
                     await response_msg.edit(content="❌ Task cancelled by user")
                     break
                 elif chunk_type == 'error':
                     await response_msg.edit(content=f"❌ Error: {content}")
                     break
-                elif chunk_type == 'code':
-                    # Accumulate code blocks
-                    language = chunk.get('metadata', {}).get('language', 'python')
-                    code_blocks.append(f"```{language}\n{content}\n```")
-                elif chunk_type == 'console':
-                    # Accumulate console output
-                    console_output.append(f"```console\n{content}\n```")
-                elif chunk_type == 'confirmation':
-                    # Show confirmation message
-                    full_content.append(f"✅ Auto-confirmed: {content}")
-                else:  # message type
-                    full_content.append(content)
+                else:
+
+                    if chunk_type != last_chuck_type:
+                        # Flush current content
+                        if current_content:
+                            formatted = self._format_display_content(
+                                current_content, last_chuck_type
+                            )
+                            full_content.append(formatted)
+                            current_content = [chunk['content']]
+                        last_chuck_type = chunk_type
+                    else:
+                        current_content.append(chunk['content'])
 
                 # Update message periodically with accumulated content
                 try:
-                    display_content = self._format_display_content(
-                        full_content, code_blocks, console_output
-                    )
-                    print(f"Updating message with content length: {len(display_content)}")
+                    full_content.append(self._format_display_content(current_content, chunk_type))
+                    display_content = "\n".join(full_content)
+                    full_content.pop(-1)  # Remove last added content to avoid duplication
 
                     await response_msg.edit(content=display_content)
                 except discord.errors.HTTPException:
@@ -140,17 +146,12 @@ class ProductivityBot(commands.Bot):
                     # Rate limited, wait a bit
                     await asyncio.sleep(1)
 
-            # Final update
-            final_content = self._format_display_content(
-                full_content, code_blocks, console_output
-            )
-
             # Save assistant response to database
             self.db.add_message(
                 user_id='bot',
                 username=self.user.name,
                 role='assistant',
-                content=final_content,
+                content=display_content,
                 message_type='mixed'
             )
 
@@ -168,20 +169,23 @@ class ProductivityBot(commands.Bot):
         response_msg = await message.reply("🤔 Processing...")
         await self.process_message(response_msg, message.content)
 
-    def _format_display_content(self, messages, code_blocks, console_output):
+    def _format_display_content(self, messages, message_type):
         """Format content for Discord display"""
-        parts = []
-        
-        if messages:
-            parts.append('\n'.join(messages))
-        
-        if code_blocks:
-            parts.append('\n**Code:**\n' + '\n'.join(code_blocks))
-        
-        if console_output:
-            parts.append('\n**Output:**\n' + '\n'.join(console_output))
-        
-        return '\n'.join(parts) if parts else "🤔 Processing..."
+
+        if message_type == 'message':
+            return ' '.join(messages)
+        elif message_type == 'code':
+            language = messages[0].get('format', 'python')
+            return f"```{language}\n{' '.join(messages)}\n```"
+        elif message_type == 'console':
+            return f"```console\n{' '.join(messages)}\n```"
+        elif message_type == 'confirmation': # Todo: handle confirmation better
+            ask_content = " ".join([msg["content"] for msg in messages])
+            ask_format = messages[0].get('format', 'text')
+            ask_message = self._format_display_content(ask_content, ask_format)
+            return f"**Confirmation needed:**\n{ask_message}"
+
+        return "".join(messages)
     
     async def _send_as_file(self, message, content):
         """Send long content as a file"""

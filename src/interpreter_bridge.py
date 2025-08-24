@@ -107,7 +107,6 @@ Remember: User safety and consent are paramount. Never execute code without expl
             yield {
                 'type': 'error',
                 'content': 'Interpreter not initialized. Check LM Studio is running.',
-                'metadata': {}
             }
             return
         
@@ -134,9 +133,6 @@ Remember: User safety and consent are paramount. Never execute code without expl
                 try:
                     if not self.output_queue.empty():
                         chunk = self.output_queue.get(timeout=0.1)
-                        print(f"Output chunk: {chunk}")
-                        print(thread.is_alive(), not self.output_queue.empty())
-
                         
                         # Check for cancellation
                         if chunk.get('type') == 'cancelled':
@@ -146,21 +142,37 @@ Remember: User safety and consent are paramount. Never execute code without expl
                         if current_type is None:
                             current_type = chunk['type']
 
-                        accumulated_content.append(chunk['content'])
+                        if current_type == 'confirmation':
+                            # Yield confirmation immediately
+                            yield chunk
+                            current_type = None
+                            last_yield_time = time.time()
+                            continue
 
-                        # Yield accumulated content periodically
-                        if time.time() - last_yield_time > 0.5 or len(accumulated_content) > 10:
-                            yield {
-                                'type': current_type,
-                                'content': ''.join(accumulated_content),
-                                'metadata': chunk.get('metadata', {})
-                            }
-                            accumulated_content = []
+                        if chunk['type'] != current_type:
+                            # Yield accumulated content of previous type
+                            if len(accumulated_content) > 0:
+                                yield {
+                                    'type': current_type,
+                                    'content': ''.join(accumulated_content),
+                                }
+                            accumulated_content = [chunk['content']]
+                            current_type = chunk['type']
                             last_yield_time = time.time()
 
+                        else:
+                            accumulated_content.append(chunk['content'])
+                            # Yield accumulated content periodically
+                            if time.time() - last_yield_time > 0.5 or len(accumulated_content) > 10:
+                                yield {
+                                    'type': current_type,
+                                    'content': ''.join(accumulated_content),
+                                }
+                                accumulated_content = []
+                                last_yield_time = time.time()
+
                     await asyncio.sleep(0.01)  # Small delay to prevent CPU spinning
-                    print(f"ok 1")
-                    
+
                 except Exception as e:
                     logger.error(f"Error retrieving from output queue {e}")
                     await asyncio.sleep(0.01)
@@ -171,9 +183,7 @@ Remember: User safety and consent are paramount. Never execute code without expl
                 yield {
                     'type': current_type,
                     'content': ''.join(accumulated_content),
-                    'metadata': {}
                 }
-            print(f"ok 2")
             # Ensure thread is done
             thread.join(timeout=1.0)
             
@@ -182,7 +192,6 @@ Remember: User safety and consent are paramount. Never execute code without expl
             yield {
                 'type': 'error',
                 'content': str(e),
-                'metadata': {}
             }
     
     def _run_interpreter_stream(self, message: str):
@@ -193,18 +202,22 @@ Remember: User safety and consent are paramount. Never execute code without expl
                     self.output_queue.put({
                         'type': 'cancelled',
                         'content': 'Task cancelled by user',
-                        'metadata': {}
                     })
                     break
                 
                 # Process streaming chunk
                 if chunk:
                     if 'content' in chunk:
+
+                        # Only return output for running code
+                        if chunk.get('type') == 'console' and chunk.get('format') == 'active_line':
+                            continue
+
                         self.output_queue.put({
+                            'role': chunk.get('role', 'assistant'),
                             'type': chunk.get('type', 'message'),
                             'content': chunk['content'],
                             'format': chunk.get('format', 'text'),
-                            'metadata': chunk.get('metadata', {})
                         })
 
         except Exception as e:
@@ -212,7 +225,6 @@ Remember: User safety and consent are paramount. Never execute code without expl
             self.output_queue.put({
                 'type': 'error',
                 'content': str(e),
-                'metadata': {}
             })
     
     def cancel_current_task(self):
