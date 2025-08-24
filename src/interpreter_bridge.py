@@ -40,11 +40,11 @@ class InterpreterBridge:
             interpreter.llm.api_base = lm_studio_url
             interpreter.llm.api_key = "not-needed"  # LM Studio doesn't need API key
             
-            # Configure interpreter settings
-            interpreter.auto_run = True  # Auto-run commands for automation
-            interpreter.verbose = True  # Show what's happening
-            interpreter.safe_mode = 'off'  # Trust local execution
-            interpreter.offline = True  # Use local models
+            # Configure interpreter settings from environment
+            interpreter.auto_run = os.getenv('INTERPRETER_AUTO_RUN', 'false').lower() == 'true'
+            interpreter.verbose = os.getenv('INTERPRETER_VERBOSE', 'true').lower() == 'true'
+            interpreter.safe_mode = os.getenv('INTERPRETER_SAFE_MODE', 'ask')  # 'off', 'ask', or 'auto'
+            interpreter.offline = os.getenv('INTERPRETER_OFFLINE', 'true').lower() == 'true'
             
             # Set context window and max tokens from env
             interpreter.llm.context_window = int(os.getenv('LLM_CONTEXT_WINDOW', 8192))
@@ -53,10 +53,22 @@ class InterpreterBridge:
             # Set output directory
             output_dir = os.path.abspath("src/output")
             os.makedirs(output_dir, exist_ok=True)
-            interpreter.system_message += f"""When saving files, use the output directory: {output_dir}
-            You can read and write files from/to this directory.
-            Current working directory: {os.getcwd()}
-            """
+            
+            # Enhanced system message with confirmation requirement
+            interpreter.system_message += f"""You are a helpful AI assistant with access to the user's computer.
+
+IMPORTANT RULES:
+1. When saving files, use the output directory: {output_dir}
+2. You can read and write files from/to this directory.
+3. Current working directory: {os.getcwd()}
+4. ALWAYS ask for user confirmation before running any code or system commands.
+5. Explain what the code will do before asking for confirmation.
+6. Format your confirmation requests clearly, like:
+   "I'm about to run a command that will [description]. 
+   This will [effects].
+   Do you want me to proceed?"
+
+Remember: User safety and consent are paramount. Never execute code without explicit permission."""
             
             self.interpreter = interpreter
             self.output_dir = output_dir
@@ -134,7 +146,7 @@ class InterpreterBridge:
                             accumulated_content.append(chunk['content'])
                             
                             # Yield accumulated content periodically
-                            if time.time() - last_yield_time > 0.5:  # Every 500ms
+                            if time.time() - last_yield_time > 0.2 or len(accumulated_content) > 10:
                                 yield {
                                     'type': current_type,
                                     'content': ''.join(accumulated_content),
@@ -230,10 +242,10 @@ class InterpreterBridge:
                 
                 return not self.cancel_flag.is_set()
             
-            # Set custom display
-            original_display = getattr(self.interpreter, 'display', None)
-            self.interpreter.display = display_output
-            
+            # # Set custom display
+            # original_display = getattr(self.interpreter, 'display', None)
+            # self.interpreter.display = display_output
+
             # Run interpreter
             for chunk in self.interpreter.chat(message, display=True, stream=True):
                 if self.cancel_flag.is_set():
@@ -260,9 +272,9 @@ class InterpreterBridge:
                             'metadata': {}
                         })
             
-            # Restore original display
-            if original_display:
-                self.interpreter.display = original_display
+            # # Restore original display
+            # if original_display:
+            #     self.interpreter.display = original_display
                 
         except Exception as e:
             logger.error(f"Interpreter execution error: {e}")

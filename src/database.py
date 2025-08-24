@@ -151,20 +151,28 @@ class ChatDatabase:
         return context
     
     def clear_old_messages(self, days: int = 30):
-        """Clear messages older than specified days"""
+        """Clear messages older than specified days. If days=0, clear all messages."""
         try:
             with sqlite3.connect(self.db_path) as conn:
                 cursor = conn.cursor()
                 
-                cursor.execute("""
-                    DELETE FROM messages
-                    WHERE timestamp < datetime('now', '-' || ? || ' days')
-                """, (days,))
+                if days == 0:
+                    # Clear all messages
+                    cursor.execute("DELETE FROM messages")
+                else:
+                    # Clear messages older than specified days
+                    cursor.execute("""
+                        DELETE FROM messages
+                        WHERE timestamp < datetime('now', '-' || ? || ' days')
+                    """, (days,))
                 
                 deleted = cursor.rowcount
                 conn.commit()
                 
-                logger.info(f"Deleted {deleted} messages older than {days} days")
+                if days == 0:
+                    logger.info(f"Deleted all {deleted} messages from history")
+                else:
+                    logger.info(f"Deleted {deleted} messages older than {days} days")
                 return deleted
                 
         except Exception as e:

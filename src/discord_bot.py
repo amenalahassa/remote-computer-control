@@ -9,9 +9,9 @@ from discord import app_commands
 import os
 import logging
 import asyncio
+import time
 from interpreter_bridge import InterpreterBridge
 from database import ChatDatabase
-from typing import Optional
 
 # Configure logging
 os.makedirs('src/logs', exist_ok=True)
@@ -72,7 +72,7 @@ class ProductivityBot(commands.Bot):
         # Ignore bot's own messages
         if message.author.bot:
             return
-        
+
         # Log the message to database
         self.db.add_message(
             user_id=str(message.author.id),
@@ -81,7 +81,6 @@ class ProductivityBot(commands.Bot):
             content=message.content,
             message_type='text'
         )
-        
         # Check if message is a command first
         ctx = await self.get_context(message)
         if ctx.valid:
@@ -211,7 +210,7 @@ bot = ProductivityBot()
 @bot.tree.command(name="ask", description="Ask the AI assistant anything")
 @app_commands.describe(prompt="Your question or task for the AI")
 async def ask(interaction: discord.Interaction, prompt: str):
-    """Slash command to ask the AI"""
+    """Slash command to ask the AI with streaming"""
     await interaction.response.defer()
     
     # Log to database
@@ -223,43 +222,81 @@ async def ask(interaction: discord.Interaction, prompt: str):
         message_type='text'
     )
     
-    # Process with streaming
-    full_response = []
-    
     try:
-        async for chunk in bot.interpreter_bridge.process_message_stream(prompt):
-            if chunk.get('type') == 'error':
-                await interaction.followup.send(f"❌ Error: {chunk.get('content')}")
-                return
-            elif chunk.get('type') == 'cancelled':
-                await interaction.followup.send("❌ Task cancelled")
-                return
-            else:
-                full_response.append(chunk.get('content', ''))
+        # Send initial message
+        response_msg = await interaction.followup.send("🤔 Processing...", wait=True)
+        bot.active_messages[response_msg.id] = True
         
-        response_text = ''.join(full_response)
+        # Stream content accumulation
+        full_content = []
+        code_blocks = []
+        console_output = []
+        last_update_time = time.time()
+        
+        # Process streaming response
+        async for chunk in bot.interpreter_bridge.process_message_stream(prompt):
+            # Check if cancelled
+            if response_msg.id not in bot.active_messages:
+                break
+            
+            chunk_type = chunk.get('type', 'message')
+            content = chunk.get('content', '')
+            
+            if chunk_type == 'cancelled':
+                await response_msg.edit(content="❌ Task cancelled by user")
+                break
+            elif chunk_type == 'error':
+                await response_msg.edit(content=f"❌ Error: {content}")
+                break
+            elif chunk_type == 'code':
+                language = chunk.get('metadata', {}).get('language', 'python')
+                code_blocks.append(f"```{language}\n{content}\n```")
+            elif chunk_type == 'console':
+                console_output.append(f"```console\n{content}\n```")
+            elif chunk_type == 'confirmation':
+                full_content.append(f"✅ Auto-confirmed: {content}")
+            else:  # message type
+                full_content.append(content)
+            
+            # Update message periodically (every 0.5 seconds)
+            if time.time() - last_update_time > 0.5:
+                try:
+                    display_content = bot._format_display_content(
+                        full_content, code_blocks, console_output
+                    )
+                    
+                    # Discord message limit check
+                    if len(display_content) > 1900:
+                        display_content = display_content[:1900] + "..."
+                    
+                    await response_msg.edit(content=display_content)
+                    last_update_time = time.time()
+                except discord.errors.HTTPException:
+                    await asyncio.sleep(0.5)
+        
+        # Final update
+        final_content = bot._format_display_content(
+            full_content, code_blocks, console_output
+        )
         
         # Save to database
         bot.db.add_message(
             user_id='bot',
             username=bot.user.name,
             role='assistant',
-            content=response_text,
-            message_type='text'
+            content=final_content,
+            message_type='mixed'
         )
         
-        # Send response
-        if len(response_text) > 1900:
-            # Send as file
-            output_path = os.path.join(bot.interpreter_bridge.get_output_directory(), 'response.txt')
-            with open(output_path, 'w', encoding='utf-8') as f:
-                f.write(response_text)
-            await interaction.followup.send(
-                "Response was too long, sending as file:",
-                file=discord.File(output_path)
-            )
+        # Final message update
+        if len(final_content) > 1900:
+            await response_msg.edit(content=final_content[:1900] + "\n\n*[Output truncated]*")
         else:
-            await interaction.followup.send(f"```\n{response_text}\n```")
+            await response_msg.edit(content=final_content)
+        
+        # Clean up
+        if response_msg.id in bot.active_messages:
+            del bot.active_messages[response_msg.id]
             
     except Exception as e:
         logger.error(f"Error in ask command: {e}")
@@ -324,6 +361,32 @@ async def history(interaction: discord.Interaction):
         logger.error(f"Error exporting history: {e}")
         await interaction.followup.send(f"❌ Error: {str(e)}")
 
+@bot.tree.command(name="flush", description="Clear all chat history from database")
+async def flush(interaction: discord.Interaction):
+    """Clear all chat history from the database"""
+    try:
+        # Clear messages from database
+        cleared = bot.db.clear_old_messages(days=0)  # Clear all messages
+        
+        # Reset interpreter conversation
+        bot.interpreter_bridge.reset_conversation()
+        
+        # Respond with confirmation
+        embed = discord.Embed(
+            title="🗑️ History Flushed",
+            description=f"Successfully cleared {cleared} messages from the database.",
+            color=discord.Color.green()
+        )
+        embed.add_field(name="Conversation", value="✅ Reset", inline=True)
+        embed.add_field(name="Database", value="✅ Cleared", inline=True)
+        
+        await interaction.response.send_message(embed=embed)
+        logger.info(f"Flushed {cleared} messages from history by {interaction.user.name}")
+        
+    except Exception as e:
+        logger.error(f"Error flushing history: {e}")
+        await interaction.response.send_message(f"❌ Error flushing history: {str(e)}")
+
 @bot.tree.command(name="help_ai", description="Show help for using the AI assistant")
 async def help_ai(interaction: discord.Interaction):
     """Show help message"""
@@ -336,6 +399,7 @@ async def help_ai(interaction: discord.Interaction):
 • `/status` - Check bot and interpreter status
 • `/reset` - Reset conversation context
 • `/history` - Export chat history
+• `/flush` - Clear all chat history from database
 • `/help_ai` - Show this help
 
 **Natural Language (just type!):**
@@ -348,9 +412,11 @@ async def help_ai(interaction: discord.Interaction):
 • 🔄 Streaming responses - see output as it's generated
 • 💾 Persistent chat history across sessions
 • 📁 Output directory for all generated files
+• 🔒 Safe mode - requires confirmation before running code
 • ❌ Cancel long-running tasks with `/cancel`
 
 **Output Directory:** All files are saved to `src/output/`
+**Safety:** Code execution requires confirmation (auto_run disabled)
     """
     
     embed = discord.Embed(
