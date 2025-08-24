@@ -25,7 +25,7 @@ class InterpreterBridge:
             from interpreter import interpreter
             
             # Configure for LM Studio
-            llm_provider = os.getenv('LLM_PROVIDER', 'lmstudio')
+            llm_provider = os.getenv('LLM_PROVIDER', 'lm_studio')
             llm_model = os.getenv('LLM_MODEL', 'google/gemma-3n-e4b')
             lm_studio_url = os.getenv('LM_STUDIO_BASE_URL', 'http://localhost:1234/v1')
             
@@ -39,6 +39,9 @@ class InterpreterBridge:
             interpreter.verbose = True  # Show what's happening
             interpreter.safe_mode = 'off'  # Trust local execution
             interpreter.offline = True  # Use local models
+
+            interpreter.llm.context_window = int(os.getenv('LLM_CONTEXT_WINDOW', 5))
+            interpreter.llm.max_tokens = int(os.getenv('LLM_MAX_TOKENS', 1000))
             
             self.interpreter = interpreter
             
