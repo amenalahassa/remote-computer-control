@@ -112,8 +112,7 @@ Remember: User safety and consent are paramount. Never execute code without expl
             return
         
         try:
-            logger.info(f"Processing message with streaming: {message[:100]}...")
-            
+
             # Clear cancel flag and queue
             self.cancel_flag.clear()
             while not self.output_queue.empty():
@@ -135,44 +134,37 @@ Remember: User safety and consent are paramount. Never execute code without expl
                 try:
                     if not self.output_queue.empty():
                         chunk = self.output_queue.get(timeout=0.1)
+                        print(f"Output chunk: {chunk}")
+                        print(thread.is_alive(), not self.output_queue.empty())
+
                         
                         # Check for cancellation
                         if chunk.get('type') == 'cancelled':
                             yield chunk
                             break
-                        
-                        # Accumulate similar types for batching
-                        if current_type == chunk['type'] and chunk['type'] == 'message':
-                            accumulated_content.append(chunk['content'])
-                            
-                            # Yield accumulated content periodically
-                            if time.time() - last_yield_time > 0.2 or len(accumulated_content) > 10:
-                                yield {
-                                    'type': current_type,
-                                    'content': ''.join(accumulated_content),
-                                    'metadata': chunk.get('metadata', {})
-                                }
-                                accumulated_content = []
-                                last_yield_time = time.time()
-                        else:
-                            # Yield any accumulated content first
-                            if accumulated_content:
-                                yield {
-                                    'type': current_type,
-                                    'content': ''.join(accumulated_content),
-                                    'metadata': {}
-                                }
-                                accumulated_content = []
-                            
-                            # Yield the new chunk
-                            yield chunk
+
+                        if current_type is None:
                             current_type = chunk['type']
+
+                        accumulated_content.append(chunk['content'])
+
+                        # Yield accumulated content periodically
+                        if time.time() - last_yield_time > 0.5 or len(accumulated_content) > 10:
+                            yield {
+                                'type': current_type,
+                                'content': ''.join(accumulated_content),
+                                'metadata': chunk.get('metadata', {})
+                            }
+                            accumulated_content = []
                             last_yield_time = time.time()
-                    
+
                     await asyncio.sleep(0.01)  # Small delay to prevent CPU spinning
+                    print(f"ok 1")
                     
-                except:
+                except Exception as e:
+                    logger.error(f"Error retrieving from output queue {e}")
                     await asyncio.sleep(0.01)
+
             
             # Yield any remaining accumulated content
             if accumulated_content:
@@ -181,7 +173,7 @@ Remember: User safety and consent are paramount. Never execute code without expl
                     'content': ''.join(accumulated_content),
                     'metadata': {}
                 }
-            
+            print(f"ok 2")
             # Ensure thread is done
             thread.join(timeout=1.0)
             
@@ -196,58 +188,7 @@ Remember: User safety and consent are paramount. Never execute code without expl
     def _run_interpreter_stream(self, message: str):
         """Run interpreter and stream output (runs in thread)"""
         try:
-            # Custom display function to capture streaming output
-            def display_output(output):
-                if self.cancel_flag.is_set():
-                    return False  # Stop execution
-                
-                # Parse output type
-                if isinstance(output, dict):
-                    output_type = output.get('type', 'message')
-                    content = output.get('content', '')
-                    
-                    if output_type == 'code':
-                        self.output_queue.put({
-                            'type': 'code',
-                            'content': content,
-                            'metadata': {'language': output.get('language', 'python')}
-                        })
-                    elif output_type == 'console':
-                        self.output_queue.put({
-                            'type': 'console',
-                            'content': content,
-                            'metadata': {}
-                        })
-                    elif output_type == 'confirmation':
-                        # Auto-confirm for now
-                        self.output_queue.put({
-                            'type': 'confirmation',
-                            'content': content,
-                            'metadata': {'auto_confirmed': True}
-                        })
-                        return True  # Confirm execution
-                    else:
-                        self.output_queue.put({
-                            'type': 'message',
-                            'content': str(content),
-                            'metadata': {}
-                        })
-                else:
-                    # Plain text output
-                    self.output_queue.put({
-                        'type': 'message',
-                        'content': str(output),
-                        'metadata': {}
-                    })
-                
-                return not self.cancel_flag.is_set()
-            
-            # # Set custom display
-            # original_display = getattr(self.interpreter, 'display', None)
-            # self.interpreter.display = display_output
-
-            # Run interpreter
-            for chunk in self.interpreter.chat(message, display=True, stream=True):
+            for chunk in self.interpreter.chat(message, display=False, stream=True):
                 if self.cancel_flag.is_set():
                     self.output_queue.put({
                         'type': 'cancelled',
@@ -258,24 +199,14 @@ Remember: User safety and consent are paramount. Never execute code without expl
                 
                 # Process streaming chunk
                 if chunk:
-                    if isinstance(chunk, dict):
-                        if 'content' in chunk:
-                            self.output_queue.put({
-                                'type': chunk.get('type', 'message'),
-                                'content': chunk['content'],
-                                'metadata': chunk.get('metadata', {})
-                            })
-                    else:
+                    if 'content' in chunk:
                         self.output_queue.put({
-                            'type': 'message',
-                            'content': str(chunk),
-                            'metadata': {}
+                            'type': chunk.get('type', 'message'),
+                            'content': chunk['content'],
+                            'format': chunk.get('format', 'text'),
+                            'metadata': chunk.get('metadata', {})
                         })
-            
-            # # Restore original display
-            # if original_display:
-            #     self.interpreter.display = original_display
-                
+
         except Exception as e:
             logger.error(f"Interpreter execution error: {e}")
             self.output_queue.put({

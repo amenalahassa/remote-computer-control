@@ -9,7 +9,6 @@ from discord import app_commands
 import os
 import logging
 import asyncio
-import time
 from interpreter_bridge import InterpreterBridge
 from database import ChatDatabase
 
@@ -90,29 +89,25 @@ class ProductivityBot(commands.Bot):
         # If not a command, process with Open Interpreter
         if message.content.strip():
             await self.process_with_interpreter_stream(message)
-    
-    async def process_with_interpreter_stream(self, message):
-        """Send message to Open Interpreter with streaming response"""
+
+    async def process_message(self, response_msg, content):
+        """Process message without streaming (legacy)"""
+        self.active_messages[response_msg.id] = True  # Mark message as active
         try:
-            # Create initial message
-            response_msg = await message.reply("🤔 Processing...")
-            self.active_messages[response_msg.id] = True
-            
             # Stream content accumulation
             full_content = []
             code_blocks = []
             console_output = []
-            current_section = "message"
-            
+
             # Process streaming response
-            async for chunk in self.interpreter_bridge.process_message_stream(message.content):
+            async for chunk in self.interpreter_bridge.process_message_stream(content):
                 # Check if message was cancelled
                 if response_msg.id not in self.active_messages:
                     break
-                
+
                 chunk_type = chunk.get('type', 'message')
                 content = chunk.get('content', '')
-                
+
                 if chunk_type == 'cancelled':
                     await response_msg.edit(content="❌ Task cancelled by user")
                     break
@@ -123,40 +118,33 @@ class ProductivityBot(commands.Bot):
                     # Accumulate code blocks
                     language = chunk.get('metadata', {}).get('language', 'python')
                     code_blocks.append(f"```{language}\n{content}\n```")
-                    current_section = "code"
                 elif chunk_type == 'console':
                     # Accumulate console output
                     console_output.append(f"```console\n{content}\n```")
-                    current_section = "console"
                 elif chunk_type == 'confirmation':
                     # Show confirmation message
                     full_content.append(f"✅ Auto-confirmed: {content}")
                 else:  # message type
                     full_content.append(content)
-                    current_section = "message"
-                
+
                 # Update message periodically with accumulated content
                 try:
                     display_content = self._format_display_content(
                         full_content, code_blocks, console_output
                     )
-                    
-                    # Discord message limit
-                    if len(display_content) > 1900:
-                        # Save to file and send
-                        await self._send_as_file(response_msg, display_content)
-                        break
-                    else:
-                        await response_msg.edit(content=display_content)
+                    print(f"Updating message with content length: {len(display_content)}")
+
+                    await response_msg.edit(content=display_content)
                 except discord.errors.HTTPException:
+                    print(f"Error updating message, content too long")
                     # Rate limited, wait a bit
                     await asyncio.sleep(1)
-            
+
             # Final update
             final_content = self._format_display_content(
                 full_content, code_blocks, console_output
             )
-            
+
             # Save assistant response to database
             self.db.add_message(
                 user_id='bot',
@@ -165,15 +153,21 @@ class ProductivityBot(commands.Bot):
                 content=final_content,
                 message_type='mixed'
             )
-            
+
             # Clean up active message
             if response_msg.id in self.active_messages:
                 del self.active_messages[response_msg.id]
-                
+
         except Exception as e:
             logger.error(f"Error processing message: {e}")
-            await message.reply(f"❌ An error occurred: {str(e)}")
+            await response_msg.edit(content=f"❌ An error occurred: {str(e)}")
     
+    async def process_with_interpreter_stream(self, message):
+        """Send message to Open Interpreter with streaming response"""
+        # Create initial message
+        response_msg = await message.reply("🤔 Processing...")
+        await self.process_message(response_msg, message.content)
+
     def _format_display_content(self, messages, code_blocks, console_output):
         """Format content for Discord display"""
         parts = []
@@ -221,86 +215,10 @@ async def ask(interaction: discord.Interaction, prompt: str):
         content=prompt,
         message_type='text'
     )
-    
-    try:
-        # Send initial message
-        response_msg = await interaction.followup.send("🤔 Processing...", wait=True)
-        bot.active_messages[response_msg.id] = True
-        
-        # Stream content accumulation
-        full_content = []
-        code_blocks = []
-        console_output = []
-        last_update_time = time.time()
-        
-        # Process streaming response
-        async for chunk in bot.interpreter_bridge.process_message_stream(prompt):
-            # Check if cancelled
-            if response_msg.id not in bot.active_messages:
-                break
-            
-            chunk_type = chunk.get('type', 'message')
-            content = chunk.get('content', '')
-            
-            if chunk_type == 'cancelled':
-                await response_msg.edit(content="❌ Task cancelled by user")
-                break
-            elif chunk_type == 'error':
-                await response_msg.edit(content=f"❌ Error: {content}")
-                break
-            elif chunk_type == 'code':
-                language = chunk.get('metadata', {}).get('language', 'python')
-                code_blocks.append(f"```{language}\n{content}\n```")
-            elif chunk_type == 'console':
-                console_output.append(f"```console\n{content}\n```")
-            elif chunk_type == 'confirmation':
-                full_content.append(f"✅ Auto-confirmed: {content}")
-            else:  # message type
-                full_content.append(content)
-            
-            # Update message periodically (every 0.5 seconds)
-            if time.time() - last_update_time > 0.5:
-                try:
-                    display_content = bot._format_display_content(
-                        full_content, code_blocks, console_output
-                    )
-                    
-                    # Discord message limit check
-                    if len(display_content) > 1900:
-                        display_content = display_content[:1900] + "..."
-                    
-                    await response_msg.edit(content=display_content)
-                    last_update_time = time.time()
-                except discord.errors.HTTPException:
-                    await asyncio.sleep(0.5)
-        
-        # Final update
-        final_content = bot._format_display_content(
-            full_content, code_blocks, console_output
-        )
-        
-        # Save to database
-        bot.db.add_message(
-            user_id='bot',
-            username=bot.user.name,
-            role='assistant',
-            content=final_content,
-            message_type='mixed'
-        )
-        
-        # Final message update
-        if len(final_content) > 1900:
-            await response_msg.edit(content=final_content[:1900] + "\n\n*[Output truncated]*")
-        else:
-            await response_msg.edit(content=final_content)
-        
-        # Clean up
-        if response_msg.id in bot.active_messages:
-            del bot.active_messages[response_msg.id]
-            
-    except Exception as e:
-        logger.error(f"Error in ask command: {e}")
-        await interaction.followup.send(f"❌ Error: {str(e)}")
+
+    # Send initial message
+    response_msg = await interaction.followup.send("🤔 Processing...", wait=True)
+    await bot.process_message(response_msg, prompt)
 
 @bot.tree.command(name="cancel", description="Cancel the current AI task")
 async def cancel(interaction: discord.Interaction):
