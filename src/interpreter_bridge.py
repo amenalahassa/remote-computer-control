@@ -13,6 +13,7 @@ from queue import Queue
 import time
 from src.runner.lpython import PythonLocal
 from src.runner.lpowershell import PowerShellLocal
+from constants import MessageType, SpecialTags
 
 logger = logging.getLogger(__name__)
 
@@ -56,16 +57,20 @@ class InterpreterBridge:
             output_dir = os.getenv("INTERPRETER_OUTPUT_DIR", os.path.join(os.getcwd(), "interpreter_output"))
             os.makedirs(output_dir, exist_ok=True)
 
-            # Enhanced system message with confirmation requirement
-            interpreter.custom_instructions  += f"""
+            # Enhanced system message with confirmation requirement and GEN_FILE instruction
+            interpreter.custom_instructions += f"""
 IMPORTANT RULES:
-2. You can read and write files from/to this directory.
-4. ALWAYS ask for user confirmation before running any code or system commands.
-5. Explain what the code will do before asking for confirmation.
-6. Format your confirmation requests clearly, like:
+1. You can read and write files from/to the output directory: {output_dir}
+2. ALWAYS ask for user confirmation before running any code or system commands.
+3. Explain what the code will do before asking for confirmation.
+4. Format your confirmation requests clearly, like:
    "I'm about to run a command that will [description]. 
    This will [effects].
    Do you want me to proceed?
+5. When you create, generate, or save any file, ALWAYS specify the full file path using this exact format:
+   {SpecialTags.GEN_FILE_START.value}full/path/to/file.ext{SpecialTags.GEN_FILE_END.value}
+   This helps the system automatically attach files to responses.
+   Example: {SpecialTags.GEN_FILE_START.value}{output_dir}/example.txt{SpecialTags.GEN_FILE_END.value}
 Remember: User safety and consent are paramount. Never execute code without explicit permission."""
 
             # Advanced capabilities
@@ -112,7 +117,7 @@ Remember: User safety and consent are paramount. Never execute code without expl
         """
         if not self.interpreter:
             yield {
-                'type': 'error',
+                'type': MessageType.ERROR.value,
                 'content': 'Interpreter not initialized. Check LM Studio is running.',
             }
             return
@@ -143,7 +148,7 @@ Remember: User safety and consent are paramount. Never execute code without expl
                         chunk = self.output_queue.get(timeout=0.1)
                         
                         # Check for cancellation
-                        if chunk.get('type') == 'cancelled':
+                        if chunk.get('type') == MessageType.CANCELLED.value:
                             yield chunk
                             break
 
@@ -154,7 +159,7 @@ Remember: User safety and consent are paramount. Never execute code without expl
                                 "role": chunk.get('role', 'assistant'),
                             }
 
-                        if current_type == 'confirmation' or isinstance(chunk["content"], dict):
+                        if current_type == MessageType.CONFIRMATION.value or isinstance(chunk["content"], dict):
 
                             # Yield accumulated content of previous type
                             if len(accumulated_content) > 0:
@@ -230,7 +235,7 @@ Remember: User safety and consent are paramount. Never execute code without expl
                 print(chunk)
                 if self.cancel_flag.is_set():
                     self.output_queue.put({
-                        'type': 'cancelled',
+                        'type': MessageType.CANCELLED.value,
                         'content': 'Task cancelled by user',
                     })
                     break
@@ -240,12 +245,12 @@ Remember: User safety and consent are paramount. Never execute code without expl
                     if 'content' in chunk:
 
                         # Only return output for running code
-                        if chunk.get('type') == 'console' and chunk.get('format') == 'active_line':
+                        if chunk.get('type') == MessageType.CONSOLE.value and chunk.get('format') == 'active_line':
                             continue
 
                         self.output_queue.put({
                             'role': chunk.get('role', 'assistant'),
-                            'type': chunk.get('type', 'message'),
+                            'type': chunk.get('type', MessageType.MESSAGE.value),
                             'content': chunk['content'],
                             'format': chunk.get('format', 'text'),
                         })
@@ -253,7 +258,7 @@ Remember: User safety and consent are paramount. Never execute code without expl
         except Exception as e:
             logger.error(f"Interpreter execution error: {e}")
             self.output_queue.put({
-                'type': 'error',
+                'type': MessageType.ERROR.value,
                 'content': str(e),
             })
     

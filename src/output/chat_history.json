@@ -1,0 +1,74 @@
+[
+  {
+    "timestamp": "2025-08-25 15:58:50",
+    "user_id": "822419983388639242",
+    "username": "kcanadien",
+    "role": "user",
+    "content": "Hello, What are you?",
+    "message_type": "text",
+    "metadata": null
+  },
+  {
+    "timestamp": "2025-08-25 15:59:38",
+    "user_id": "bot",
+    "username": "RemConApp",
+    "role": "assistant",
+    "content": "",
+    "message_type": "mixed",
+    "metadata": null
+  },
+  {
+    "timestamp": "2025-08-25 15:59:54",
+    "user_id": "822419983388639242",
+    "username": "kcanadien",
+    "role": "user",
+    "content": "Take a screenshot of my computer. Save a copy to the working dir too",
+    "message_type": "text",
+    "metadata": null
+  },
+  {
+    "timestamp": "2025-08-25 16:00:16",
+    "user_id": "bot",
+    "username": "RemConApp",
+    "role": "assistant",
+    "content": "",
+    "message_type": "mixed",
+    "metadata": null
+  },
+  {
+    "timestamp": "2025-08-25 16:00:27",
+    "user_id": "822419983388639242",
+    "username": "kcanadien",
+    "role": "user",
+    "content": "Yes",
+    "message_type": "text",
+    "metadata": null
+  },
+  {
+    "timestamp": "2025-08-25 16:00:37",
+    "user_id": "bot",
+    "username": "RemConApp",
+    "role": "assistant",
+    "content": "",
+    "message_type": "mixed",
+    "metadata": null
+  },
+  {
+    "timestamp": "2025-08-25 16:01:25",
+    "user_id": "822419983388639242",
+    "username": "kcanadien",
+    "role": "user",
+    "content": "Yes, continue",
+    "message_type": "text",
+    "metadata": null
+  },
+  {
+    "timestamp": "2025-08-25 16:01:36",
+    "user_id": "bot",
+    "username": "RemConApp",
+    "role": "assistant",
+    "content": "",
+    "message_type": "mixed",
+    "metadata": null
+  }
+]

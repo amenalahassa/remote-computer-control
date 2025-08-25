@@ -7,10 +7,14 @@ import discord
 from discord.ext import commands
 from discord import app_commands
 import os
+import sys
 import logging
 import asyncio
+import re
 from interpreter_bridge import InterpreterBridge
 from database import ChatDatabase
+from constants import MessageType, SpecialTags, ServiceStatus
+from service_manager import ServiceManager
 
 # Configure logging
 os.makedirs('src/logs', exist_ok=True)
@@ -36,6 +40,8 @@ class ProductivityBot(commands.Bot):
         self.interpreter_bridge = InterpreterBridge()
         self.db = ChatDatabase()
         self.active_messages = {}  # Track active streaming messages
+        self.service_manager = ServiceManager()
+        self.shutdown_requested = False
         
         # Load conversation history on startup
         self._load_history()
@@ -88,6 +94,14 @@ class ProductivityBot(commands.Bot):
         
         # If not a command, process with Open Interpreter
         if message.content.strip():
+            # Display user message in chat for better interactivity
+            user_embed = discord.Embed(
+                title=f"💬 {message.author.display_name}",
+                description=message.content,
+                color=discord.Color.blue()
+            )
+            await message.channel.send(embed=user_embed)
+            
             await self.process_with_interpreter_stream(message)
 
 
@@ -174,13 +188,19 @@ class ProductivityBot(commands.Bot):
                 display_content += "\n\n❌ Response interrupted!"
             await response_msg.edit(content=display_content)
 
+            # Extract and send generated files if any
+            generated_files = self._extract_generated_files(display_content)
+            if generated_files:
+                for file_path in generated_files:
+                    await self._send_generated_file(response_msg, file_path)
+
             # Save assistant response to database
             self.db.add_message(
                 user_id='bot',
                 username=self.user.name,
                 role='assistant',
                 content=bot_response,
-                message_type='mixed'
+                message_type=MessageType.MIXED.value
             )
 
             # Clean up active message
@@ -217,6 +237,26 @@ class ProductivityBot(commands.Bot):
 
         return "".join(messages)
     
+    def _extract_generated_files(self, content: str) -> list:
+        """Extract file paths from GEN_FILE tags in content"""
+        pattern = re.escape(SpecialTags.GEN_FILE_START.value) + r'([^\]]+)' + re.escape(SpecialTags.GEN_FILE_END.value)
+        matches = re.findall(pattern, content)
+        return [match.strip() for match in matches]
+    
+    async def _send_generated_file(self, message, file_path: str):
+        """Send a generated file as attachment if it exists"""
+        try:
+            if os.path.exists(file_path):
+                file_name = os.path.basename(file_path)
+                await message.reply(
+                    f"📄 Generated file: `{file_name}`",
+                    file=discord.File(file_path, filename=file_name)
+                )
+            else:
+                logger.warning(f"Generated file not found: {file_path}")
+        except Exception as e:
+            logger.error(f"Failed to send generated file {file_path}: {e}")
+    
     async def _send_as_file(self, message, content):
         """Send long content as a file"""
         try:
@@ -230,6 +270,21 @@ class ProductivityBot(commands.Bot):
             )
         except Exception as e:
             logger.error(f"Failed to send as file: {e}")
+    
+    async def shutdown(self):
+        """Graceful shutdown of the bot"""
+        logger.info("Shutting down bot...")
+        self.shutdown_requested = True
+        
+        # Cancel all active messages
+        for msg_id in list(self.active_messages.keys()):
+            del self.active_messages[msg_id]
+        
+        # Cancel current interpreter task
+        if self.interpreter_bridge:
+            self.interpreter_bridge.cancel_current_task()
+        
+        await self.close()
 
 # Create bot instance
 bot = ProductivityBot()
@@ -339,6 +394,56 @@ async def flush(interaction: discord.Interaction):
         logger.error(f"Error flushing history: {e}")
         await interaction.response.send_message(f"❌ Error flushing history: {str(e)}")
 
+@bot.tree.command(name="stop", description="Stop the assistant service")
+async def stop_service(interaction: discord.Interaction):
+    """Stop the assistant service"""
+    embed = discord.Embed(
+        title="🛑 Stopping Assistant Service",
+        description="The assistant will shut down after this message.",
+        color=discord.Color.red()
+    )
+    
+    await interaction.response.send_message(embed=embed)
+    
+    # Schedule shutdown after a brief delay
+    async def delayed_shutdown():
+        await asyncio.sleep(2)
+        await bot.shutdown()
+    
+    asyncio.create_task(delayed_shutdown())
+
+@bot.tree.command(name="service_status", description="Check the service status")
+async def service_status(interaction: discord.Interaction):
+    """Check the service status"""
+    try:
+        status = bot.service_manager.get_status()
+        process_info = bot.service_manager.get_process_info()
+        
+        embed = discord.Embed(
+            title="🔧 Service Status",
+            color=discord.Color.green() if status == ServiceStatus.RUNNING else discord.Color.red()
+        )
+        
+        embed.add_field(name="Status", value=status.value.upper(), inline=True)
+        embed.add_field(name="Platform", value=bot.service_manager.platform, inline=True)
+        
+        if process_info:
+            embed.add_field(name="PID", value=str(process_info.get('pid', 'N/A')), inline=True)
+            memory_mb = process_info.get('memory_info', {}).get('rss', 0) / 1024 / 1024
+            embed.add_field(name="Memory", value=f"{memory_mb:.1f} MB", inline=True)
+            embed.add_field(name="CPU", value=f"{process_info.get('cpu_percent', 0):.1f}%", inline=True)
+        
+        await interaction.response.send_message(embed=embed)
+        
+    except Exception as e:
+        logger.error(f"Error checking service status: {e}")
+        await interaction.response.send_message(f"❌ Error checking service status: {str(e)}")
+        logger.info(f"Flushed {cleared} messages from history by {interaction.user.name}")
+        
+    except Exception as e:
+        logger.error(f"Error flushing history: {e}")
+        await interaction.response.send_message(f"❌ Error flushing history: {str(e)}")
+
 @bot.tree.command(name="help_ai", description="Show help for using the AI assistant")
 async def help_ai(interaction: discord.Interaction):
     """Show help message"""
@@ -352,11 +457,13 @@ async def help_ai(interaction: discord.Interaction):
 • `/reset` - Reset conversation context
 • `/history` - Export chat history
 • `/flush` - Clear all chat history from database
+• `/stop` - Stop the assistant service
+• `/service_status` - Check service status
 • `/help_ai` - Show this help
 
 **Natural Language (just type!):**
 • "Take a screenshot"
-• "Create a file called test.txt"
+• "Create a file called test.txt with GEN_FILE[path/to/file.txt]GEN_FILE"
 • "Show system information"
 • "What files are in the output directory?"
 
@@ -364,8 +471,15 @@ async def help_ai(interaction: discord.Interaction):
 • 🔄 Streaming responses - see output as it's generated
 • 💾 Persistent chat history across sessions
 • 📁 Output directory for all generated files
+• 📎 Auto-attach generated files with GEN_FILE tags
 • 🔒 Safe mode - requires confirmation before running code
 • ❌ Cancel long-running tasks with `/cancel`
+• 🛑 Stop service remotely with `/stop`
+
+**File Generation:**
+When creating files, use the format:
+`GEN_FILE[full/path/to/file.ext]GEN_FILE`
+The bot will automatically attach the file to the response.
 
 **Output Directory:** All files are saved to `src/output/`
 **Safety:** Code execution requires confirmation (auto_run disabled)
@@ -384,6 +498,17 @@ async def help_ai(interaction: discord.Interaction):
 async def ping(ctx):
     """Test command to check if bot is responsive"""
     await ctx.send('🏓 Pong! Assistant is running.')
+
+@bot.command(name='stop')
+async def stop_legacy(ctx):
+    """Legacy stop command"""
+    await ctx.send('🛑 Stopping assistant service...')
+    
+    async def delayed_shutdown():
+        await asyncio.sleep(2)
+        await bot.shutdown()
+    
+    asyncio.create_task(delayed_shutdown())
 
 async def run_bot(token):
     """Run the Discord bot"""

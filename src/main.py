@@ -5,8 +5,10 @@ Main entry point for the Local AI Productivity Assistant
 
 import os
 import sys
+import signal
 from dotenv import load_dotenv
 import logging
+from pathlib import Path
 
 # Add src directory to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -44,12 +46,47 @@ def check_requirements():
     
     return True
 
+def create_pid_file():
+    """Create PID file for service management"""
+    try:
+        project_root = Path(__file__).parent.parent
+        pidfile = project_root / "LocalAIAssistant.pid"
+        pidfile.write_text(str(os.getpid()))
+        logger.info(f"Created PID file: {pidfile}")
+        return pidfile
+    except Exception as e:
+        logger.error(f"Failed to create PID file: {e}")
+        return None
+
+def cleanup_pid_file(pidfile):
+    """Clean up PID file on exit"""
+    if pidfile and pidfile.exists():
+        try:
+            pidfile.unlink()
+            logger.info("PID file cleaned up")
+        except Exception as e:
+            logger.error(f"Failed to cleanup PID file: {e}")
+
+def signal_handler(signum, frame):
+    """Handle shutdown signals"""
+    logger.info(f"Received signal {signum}, shutting down...")
+    print("\n\n👋 Shutting down assistant...")
+    sys.exit(0)
+
 def main():
     """Main function to start the AI assistant"""
     print("🚀 Starting Local AI Productivity Assistant...")
     
+    # Create PID file for service management
+    pidfile = create_pid_file()
+    
+    # Setup signal handlers for graceful shutdown
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
     # Check requirements
     if not check_requirements():
+        cleanup_pid_file(pidfile)
         sys.exit(1)
     
     try:
@@ -62,6 +99,7 @@ def main():
         print("  !ping - Check if bot is responsive")
         print("  !status - Show bot and interpreter status")
         print("  !reset - Reset conversation context")
+        print("  !stop - Stop the assistant service")
         print("  !help_ai - Show help message")
         print("\nOr just type naturally for AI assistance!\n")
         
@@ -70,11 +108,12 @@ def main():
         
     except KeyboardInterrupt:
         print("\n\n👋 Shutting down assistant...")
-        sys.exit(0)
     except Exception as e:
         logger.error(f"Failed to start assistant: {e}")
         print(f"\n❌ Error: {e}")
-        sys.exit(1)
+    finally:
+        cleanup_pid_file(pidfile)
+        sys.exit(0)
 
 if __name__ == "__main__":
     main()
