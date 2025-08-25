@@ -98,9 +98,10 @@ class ProductivityBot(commands.Bot):
         try:
             # Stream content accumulation
             full_content = []
-            last_chuck_type = None
+            last_chuck = None
             current_content = []
             display_content = ""
+            bot_response = ""
 
             # Process streaming response
             async for chunk in self.interpreter_bridge.process_message_stream(content):
@@ -110,9 +111,10 @@ class ProductivityBot(commands.Bot):
 
                 chunk_type = chunk.get('type', 'message')
                 content = chunk.get('content', '')
+                metadata = chunk.get("metadata", {})
 
-                if last_chuck_type is None:
-                    last_chuck_type = chunk_type
+                if last_chuck is None:
+                    last_chuck = chunk
 
                 if chunk_type == 'cancelled':
                     await response_msg.edit(content="❌ Task cancelled by user")
@@ -122,43 +124,62 @@ class ProductivityBot(commands.Bot):
                     break
                 else:
 
-                    if chunk_type != last_chuck_type:
+                    if chunk_type != last_chuck['type']:
                         # Flush current content
-                        if current_content:
+                        if len(current_content) > 0:
+                            content_metadata = last_chuck.get("metadata", {})
+                            content_type = last_chuck.get('type', 'message')
                             formatted = self._format_display_content(
-                                current_content, last_chuck_type
+                                current_content, content_type, content_metadata
                             )
                             full_content.append(formatted)
-                            current_content = [chunk['content']]
-                        last_chuck_type = chunk_type
+                        current_content = [chunk['content']]
+                        last_chuck = chunk
                     else:
                         current_content.append(chunk['content'])
 
                 # Update message periodically with accumulated content
                 try:
-                    full_content.append(self._format_display_content(current_content, chunk_type))
+                    full_content.append(self._format_display_content(current_content, chunk_type, metadata))
                     display_content = "\n".join(full_content)
-                    full_content.pop(-1)  # Remove last added content to avoid duplication
 
-                    await response_msg.edit(content=display_content)
+                    if len(display_content) > 1000:
+                        await response_msg.edit(content=display_content)
+                        self.active_messages[response_msg.id] = False
+                        response_msg = await response_msg.reply("📄 Content too long, sending as new message...")
+
+
+                        self.active_messages[response_msg.id] = True
+                        bot_response += display_content + "\n"
+                        full_content = []
+                        current_content = []
+                    else:
+
+                        await response_msg.edit(content=display_content)
+                        full_content.pop(-1)  # Remove last added content to avoid duplication
+
+
                 except discord.errors.HTTPException:
                     print(f"Error updating message, content too long")
                     # Rate limited, wait a bit
                     await asyncio.sleep(1)
+
+            print(f"Finished processing message")
+            display_content = display_content + "\n\n✅ Response completed!"
+            await response_msg.edit(content=display_content)
 
             # Save assistant response to database
             self.db.add_message(
                 user_id='bot',
                 username=self.user.name,
                 role='assistant',
-                content=display_content,
+                content=bot_response,
                 message_type='mixed'
             )
 
             # Clean up active message
             if response_msg.id in self.active_messages:
                 del self.active_messages[response_msg.id]
-
         except Exception as e:
             logger.error(f"Error processing message: {e}")
             await response_msg.edit(content=f"❌ An error occurred: {str(e)}")
@@ -169,21 +190,24 @@ class ProductivityBot(commands.Bot):
         response_msg = await message.reply("🤔 Processing...")
         await self.process_message(response_msg, message.content)
 
-    def _format_display_content(self, messages, message_type):
+    def _format_display_content(self, messages, message_type, message_metadata):
         """Format content for Discord display"""
 
         if message_type == 'message':
-            return ' '.join(messages)
+            return ''.join(messages)
         elif message_type == 'code':
-            language = messages[0].get('format', 'python')
-            return f"```{language}\n{' '.join(messages)}\n```"
+            language = message_metadata.get('format', 'python')
+            content_title = f"**Code in ({language})**:"
+            return f"{content_title}\n\n```{language}\n{''.join(messages)}\n```"
         elif message_type == 'console':
-            return f"```console\n{' '.join(messages)}\n```"
+            content_title = f"**Console Output**:"
+            return f"{content_title}\n\n```console\n{''.join(messages)}\n```"
         elif message_type == 'confirmation': # Todo: handle confirmation better
-            ask_content = " ".join([msg["content"] for msg in messages])
-            ask_format = messages[0].get('format', 'text')
-            ask_message = self._format_display_content(ask_content, ask_format)
-            return f"**Confirmation needed:**\n{ask_message}"
+            ask_content = "\n".join([msg["content"] for msg in messages])
+            ask_format = messages[0].get('format', 'text') # Assume all messages have same format
+            ask_type = messages[0].get('type', 'message')
+            ask_message = self._format_display_content(ask_content, ask_type, {"format": ask_format})
+            return f"**Confirmation needed:**\n\n{ask_message}"
 
         return "".join(messages)
     

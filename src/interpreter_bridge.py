@@ -7,10 +7,12 @@ import logging
 import asyncio
 import os
 import threading
-from typing import Optional, Dict, Any, AsyncGenerator
+from typing import Dict, Any, AsyncGenerator
 from dotenv import load_dotenv
 from queue import Queue
 import time
+from src.runner.lpython import PythonLocal
+from src.runner.lpowershell import PowerShellLocal
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +40,7 @@ class InterpreterBridge:
             # Set up interpreter for local LLM
             interpreter.llm.model = f"{llm_provider}/{llm_model}"
             interpreter.llm.api_base = lm_studio_url
-            interpreter.llm.api_key = "not-needed"  # LM Studio doesn't need API key
+            interpreter.llm.api_key = os.getenv('LM_STUDIO_API_KEY', '')
             
             # Configure interpreter settings from environment
             interpreter.auto_run = os.getenv('INTERPRETER_AUTO_RUN', 'false').lower() == 'true'
@@ -49,18 +51,26 @@ class InterpreterBridge:
             # Set context window and max tokens from env
             interpreter.llm.context_window = int(os.getenv('LLM_CONTEXT_WINDOW', 8192))
             interpreter.llm.max_tokens = int(os.getenv('LLM_MAX_TOKENS', 2000))
+
+            # Advanced capabilities
+            interpreter.os = True
+            interpreter.llm.supports_vision = True
+            interpreter.llm.supports_functions = True
             
             # Set output directory
             output_dir = os.path.abspath("src/output")
             os.makedirs(output_dir, exist_ok=True)
+
+            os.environ['INTERPRETER_OUTPUT_DIR'] = output_dir
+            os.environ['INTERPRETER_VIRTUAL_ENV'] = os.getenv('INTERPRETER_VIRTUAL_ENV', '')
             
             # Enhanced system message with confirmation requirement
             interpreter.system_message += f"""You are a helpful AI assistant with access to the user's computer.
-
 IMPORTANT RULES:
-1. When saving files, use the output directory: {output_dir}
+1. When saving files, use the output directory: {output_dir} also available os.environ['INTERPRETER_OUTPUT_DIR'].
 2. You can read and write files from/to this directory.
 3. Current working directory: {os.getcwd()}
+4. Use the virtual environment's Python in {os.getenv("INTERPRETER_VIRTUAL_ENV")} available as os.environ['INTERPRETER_VIRTUAL_ENV'].
 4. ALWAYS ask for user confirmation before running any code or system commands.
 5. Explain what the code will do before asking for confirmation.
 6. Format your confirmation requests clearly, like:
@@ -69,6 +79,11 @@ IMPORTANT RULES:
    Do you want me to proceed?"
 
 Remember: User safety and consent are paramount. Never execute code without explicit permission."""
+
+            interpreter.computer.emit_images = True
+            interpreter.computer.import_computer_api = True
+            interpreter.computer.terminate()
+            interpreter.computer.languages = [PythonLocal, PowerShellLocal]
             
             self.interpreter = interpreter
             self.output_dir = output_dir
@@ -128,6 +143,7 @@ Remember: User safety and consent are paramount. Never execute code without expl
             last_yield_time = time.time()
             accumulated_content = []
             current_type = None
+            current_metadata = None
             
             while thread.is_alive() or not self.output_queue.empty():
                 try:
@@ -141,11 +157,27 @@ Remember: User safety and consent are paramount. Never execute code without expl
 
                         if current_type is None:
                             current_type = chunk['type']
+                            current_metadata = {
+                                "format": chunk.get('format', 'text'),
+                                "role": chunk.get('role', 'assistant'),
+                            }
 
-                        if current_type == 'confirmation':
+                        if current_type == 'confirmation' or isinstance(chunk["content"], dict):
+
+                            # Yield accumulated content of previous type
+                            if len(accumulated_content) > 0:
+                                yield {
+                                    'type': current_type,
+                                    'content': ''.join(accumulated_content),
+                                    "metadata": current_metadata
+                                }
+                                accumulated_content = []
+
                             # Yield confirmation immediately
                             yield chunk
+
                             current_type = None
+                            current_metadata = None
                             last_yield_time = time.time()
                             continue
 
@@ -158,6 +190,10 @@ Remember: User safety and consent are paramount. Never execute code without expl
                                 }
                             accumulated_content = [chunk['content']]
                             current_type = chunk['type']
+                            current_metadata = {
+                                "format": chunk.get('format', 'text'),
+                                "role": chunk.get('role', 'assistant'),
+                            }
                             last_yield_time = time.time()
 
                         else:
@@ -167,6 +203,7 @@ Remember: User safety and consent are paramount. Never execute code without expl
                                 yield {
                                     'type': current_type,
                                     'content': ''.join(accumulated_content),
+                                    "metadata": current_metadata
                                 }
                                 accumulated_content = []
                                 last_yield_time = time.time()
