@@ -1,3 +1,4 @@
+import os
 import subprocess
 import sys
 import tempfile
@@ -6,12 +7,21 @@ class PythonLocal:
     """
     Runs Python code locally instead of on E2B.
     """
-    def __init__(self):
-        # Nothing fancy here, but now __init__ is a normal function with .__code__
-        pass
 
     name = "python"
-    system_message = "# All Python code must include at least one print statement."
+    system_message = """All Python code must include at least one print statement."""
+
+    #     system_message = """
+    #     # All Python code must include at least one print statement.
+    #     # Your output dir is available os.environ['INTERPRETER_OUTPUT_DIR'].
+    #     # A virtual environment is available at os.environ['INTERPRETER_VIRTUAL_ENV'] if you need to install packages.
+    #     """
+
+    def __init__(self):
+        os.environ["INTERPRETER_OUTPUT_DIR"] = os.getenv("INTERPRETER_OUTPUT_DIR")
+        os.environ["INTERPRETER_VIRTUAL_ENV"] = os.getenv("INTERPRETER_VIRTUAL_ENV")
+        pass
+
 
     def run(self, code):
         """Generator that yields results in LMC format."""

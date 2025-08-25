@@ -102,11 +102,13 @@ class ProductivityBot(commands.Bot):
             current_content = []
             display_content = ""
             bot_response = ""
+            stream_cancelled = False
 
             # Process streaming response
             async for chunk in self.interpreter_bridge.process_message_stream(content):
                 # Check if message was cancelled
                 if response_msg.id not in self.active_messages:
+                    stream_cancelled = True
                     break
 
                 chunk_type = chunk.get('type', 'message')
@@ -117,9 +119,11 @@ class ProductivityBot(commands.Bot):
                     last_chuck = chunk
 
                 if chunk_type == 'cancelled':
+                    stream_cancelled = True
                     await response_msg.edit(content="❌ Task cancelled by user")
                     break
                 elif chunk_type == 'error':
+                    stream_cancelled = True
                     await response_msg.edit(content=f"❌ Error: {content}")
                     break
                 else:
@@ -164,8 +168,10 @@ class ProductivityBot(commands.Bot):
                     # Rate limited, wait a bit
                     await asyncio.sleep(1)
 
-            print(f"Finished processing message")
-            display_content = display_content + "\n\n✅ Response completed!"
+            if not stream_cancelled:
+                display_content += "\n\n✅ Response completed!"
+            else:
+                display_content += "\n\n❌ Response interrupted!"
             await response_msg.edit(content=display_content)
 
             # Save assistant response to database

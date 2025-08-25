@@ -43,47 +43,39 @@ class InterpreterBridge:
             interpreter.llm.api_key = os.getenv('LM_STUDIO_API_KEY', '')
             
             # Configure interpreter settings from environment
-            interpreter.auto_run = os.getenv('INTERPRETER_AUTO_RUN', 'false').lower() == 'true'
+            interpreter.auto_run = os.getenv('INTERPRETER_AUTO_RUN', 'true').lower() == 'true'
             interpreter.verbose = os.getenv('INTERPRETER_VERBOSE', 'true').lower() == 'true'
-            interpreter.safe_mode = os.getenv('INTERPRETER_SAFE_MODE', 'ask')  # 'off', 'ask', or 'auto'
+            interpreter.safe_mode = os.getenv('INTERPRETER_SAFE_MODE', 'off')  # 'off', 'ask', or 'auto'
             interpreter.offline = os.getenv('INTERPRETER_OFFLINE', 'true').lower() == 'true'
             
             # Set context window and max tokens from env
             interpreter.llm.context_window = int(os.getenv('LLM_CONTEXT_WINDOW', 8192))
             interpreter.llm.max_tokens = int(os.getenv('LLM_MAX_TOKENS', 2000))
-
-            # Advanced capabilities
-            interpreter.os = True
-            interpreter.llm.supports_vision = True
-            interpreter.llm.supports_functions = True
             
             # Set output directory
-            output_dir = os.path.abspath("src/output")
+            output_dir = os.getenv("INTERPRETER_OUTPUT_DIR", os.path.join(os.getcwd(), "interpreter_output"))
             os.makedirs(output_dir, exist_ok=True)
 
-            os.environ['INTERPRETER_OUTPUT_DIR'] = output_dir
-            os.environ['INTERPRETER_VIRTUAL_ENV'] = os.getenv('INTERPRETER_VIRTUAL_ENV', '')
-            
             # Enhanced system message with confirmation requirement
-            interpreter.system_message += f"""You are a helpful AI assistant with access to the user's computer.
+            interpreter.custom_instructions  += f"""
 IMPORTANT RULES:
-1. When saving files, use the output directory: {output_dir} also available os.environ['INTERPRETER_OUTPUT_DIR'].
 2. You can read and write files from/to this directory.
-3. Current working directory: {os.getcwd()}
-4. Use the virtual environment's Python in {os.getenv("INTERPRETER_VIRTUAL_ENV")} available as os.environ['INTERPRETER_VIRTUAL_ENV'].
 4. ALWAYS ask for user confirmation before running any code or system commands.
 5. Explain what the code will do before asking for confirmation.
 6. Format your confirmation requests clearly, like:
    "I'm about to run a command that will [description]. 
    This will [effects].
-   Do you want me to proceed?"
-
+   Do you want me to proceed?
 Remember: User safety and consent are paramount. Never execute code without explicit permission."""
 
+            # Advanced capabilities
+            interpreter.os = True
+            interpreter.llm.supports_vision = True
+            interpreter.llm.supports_functions = True
             interpreter.computer.emit_images = True
             interpreter.computer.import_computer_api = True
             interpreter.computer.terminate()
-            interpreter.computer.languages = [PythonLocal, PowerShellLocal]
+            interpreter.computer.languages += [PythonLocal, PowerShellLocal]
             
             self.interpreter = interpreter
             self.output_dir = output_dir
@@ -234,7 +226,8 @@ Remember: User safety and consent are paramount. Never execute code without expl
     def _run_interpreter_stream(self, message: str):
         """Run interpreter and stream output (runs in thread)"""
         try:
-            for chunk in self.interpreter.chat(message, display=False, stream=True):
+            for chunk in self.interpreter.chat(message, display=self.interpreter.verbose, stream=True):
+                print(chunk)
                 if self.cancel_flag.is_set():
                     self.output_queue.put({
                         'type': 'cancelled',

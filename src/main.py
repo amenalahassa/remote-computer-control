@@ -5,7 +5,6 @@ Main entry point for the Local AI Productivity Assistant
 
 import os
 import sys
-import asyncio
 from dotenv import load_dotenv
 import logging
 

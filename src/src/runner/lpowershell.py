@@ -1,5 +1,6 @@
 import subprocess
 import tempfile
+import os
 
 class PowerShellLocal:
     """
@@ -7,10 +8,18 @@ class PowerShellLocal:
     """
 
     name = "powershell"
-    system_message = "# All PowerShell code must include at least one Write-Output statement."
+    # system_message = """
+    # # All PowerShell code must include at least one Write-Output statement.
+    # # Your output dir is available in $env:INTERPRETER_OUTPUT_DIR.
+    # # A python virtual environment is available at $env:INTERPRETER_VIRTUAL_ENV if you need to install packages.
+    # """
+    system_message = """All PowerShell code must include at least one Write-Output statement."""
+
 
     def __init__(self):
-        # Needed so Open Interpreter can introspect __init__.__code__
+        # Set environment variables to be used in the PowerShell script if needed
+        os.environ["INTERPRETER_OUTPUT_DIR"] = os.getenv("INTERPRETER_OUTPUT_DIR")
+        os.environ["INTERPRETER_VIRTUAL_ENV"] = os.getenv("INTERPRETER_VIRTUAL_ENV")
         pass
 
     def run(self, code):
